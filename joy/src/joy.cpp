@@ -48,6 +48,29 @@
 namespace joy
 {
 
+#if IINO_HB
+void get_prm( const char *key, char *buf, int n, const char *dv )
+{
+	memset( buf, 0, n );
+	if ( dv == NULL )
+		dv = "";
+
+	char cmd[ 256 ];
+	sprintf( cmd, "$TOOL_DIR/car_info.py prm %s", key );
+
+	FILE *fp = popen( cmd, "r" );
+	fgets( buf, n, fp );
+	pclose( fp );
+
+	int m = strlen( buf );
+	if ( m > 0 && buf[ m - 1 ] == '\n' )
+		buf[ m - 1 ] = '\0';
+
+	if ( strcmp( buf, "None" ) == 0 )
+		strcpy( buf, dv );
+}
+#endif
+
 Joy::Joy(const rclcpp::NodeOptions & options)
 : rclcpp::Node("joy_node", options)
 {
@@ -96,7 +119,20 @@ Joy::Joy(const rclcpp::NodeOptions & options)
   // to use it; this ensures that we are always using the correct time source.
   publish_soon_time_ = this->now();
 
+#if IINO_HB
+  char topic_name[ 64 ];
+  get_prm( "joy_topic_rename", topic_name, sizeof( topic_name ), "joy_driver_local" );
+  pub_ = create_publisher<sensor_msgs::msg::Joy>(topic_name, 10);
+#else
   pub_ = create_publisher<sensor_msgs::msg::Joy>("joy", 10);
+#endif
+
+#if IINO_HB
+  const char *cmd = "$TOOL_DIR/car_info.py prm /use_joy_pwr | grep -e True -e None > /dev/null";
+  use_joy_pwr_ = system( cmd ) == 0;
+  //fprintf( stderr, "joy use_joy_pwr=%d\n", (int)use_joy_pwr_ );
+  pub_pwr_ = create_publisher<std_msgs::msg::String>( IINO_TOPIC, 10 );
+#endif
 
   feedback_sub_ = this->create_subscription<sensor_msgs::msg::JoyFeedback>(
     "joy/set_feedback", rclcpp::QoS(10), std::bind(
@@ -105,9 +141,6 @@ Joy::Joy(const rclcpp::NodeOptions & options)
 
   future_ = exit_signal_.get_future();
 
-  if (SDL_Init(SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC) < 0) {
-    throw std::runtime_error("SDL could not be initialized: " + std::string(SDL_GetError()));
-  }
   // In theory we could do this with just a timer, which would simplify the code
   // a bit.  But then we couldn't react to "immediate" events, so we stick with
   // the thread.
@@ -426,6 +459,12 @@ void Joy::eventThread()
   rclcpp::Time last_publish = this->now();
 
   do {
+    if (joystick_ == nullptr) {
+      if (SDL_Init(SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC) < 0) {
+        throw std::runtime_error("SDL could not be initialized: " + std::string(SDL_GetError()));
+      }
+    }
+
     bool should_publish = false;
     SDL_Event e;
     int wait_time_ms = autorepeat_interval_ms_;
@@ -435,6 +474,23 @@ void Joy::eventThread()
     int success = SDL_WaitEventTimeout(&e, wait_time_ms);
     if (success == 1) {
       // Succeeded getting an event
+#if IINO_HB
+      std::string bak = pwr_stat_;
+      if ( use_joy_pwr_ ) {
+        if ( e.type == SDL_JOYBUTTONUP && e.jbutton.button == 7 ) {
+          pwr_stat_ = IINO_OFF;
+        } else if ( e.type == SDL_JOYBUTTONDOWN && e.jbutton.button == 7 ) {
+          pwr_stat_ = IINO_ON;
+        }
+      } else {
+        pwr_stat_ = IINO_ON;
+      }
+      if ( pwr_stat_ != bak ) {
+        std_msgs::msg::String m;
+        m.data = pwr_stat_;
+        pub_pwr_->publish( m );
+      }
+#endif
       if (e.type == SDL_JOYAXISMOTION) {
         should_publish = handleJoyAxis(e);
       } else if (e.type == SDL_JOYBUTTONDOWN) {
@@ -450,16 +506,8 @@ void Joy::eventThread()
       } else {
         RCLCPP_INFO(get_logger(), "Unknown event type %d", e.type);
       }
-    }
-
-    if (!should_publish) {
-      // So far, nothing has indicated that we should publish.  However we need to
-      // do additional checking since there are several possible reasons:
-      // 1.  SDL_WaitEventTimeout failed
-      // 2.  SDL_WaitEventTimeout timed out
-      // 3.  SDL_WaitEventTimeout succeeded, but the event that happened didn't cause
-      //     a publish to happen.
-      //
+    } else {
+      // We didn't succeed, either because of a failure or because of a timeout.
       // If we are autorepeating and enough time has passed, set should_publish.
       rclcpp::Time now = this->now();
       rclcpp::Duration diff_since_last_publish = now - last_publish;
@@ -474,10 +522,18 @@ void Joy::eventThread()
     }
 
     if (joystick_ != nullptr && should_publish) {
+#if IINO_HB
+      joy_msg_.header.frame_id = "joy_local";
+#else
       joy_msg_.header.frame_id = "joy";
+#endif
       joy_msg_.header.stamp = this->now();
 
       pub_->publish(joy_msg_);
+    }
+
+    if (joystick_ == nullptr) {
+      SDL_Quit();
     }
 
     status = future_.wait_for(std::chrono::seconds(0));
